@@ -4,323 +4,339 @@ os.environ["MPLBACKEND"] = "Agg"
 import numpy as np
 import matplotlib.pyplot as plt
 import imageio.v2 as imageio
-from matplotlib.patches import Rectangle, FancyBboxPatch
+from matplotlib.patches import Ellipse, FancyBboxPatch, Rectangle
+from matplotlib.path import Path
+from matplotlib.patches import PathPatch
 
 # ============================================================
 # OUTPUT
 # ============================================================
-OUT = "Equacao_do_Movimento_AulaBasica_ICU.mp4"
+OUT = "Equacao_do_Movimento_Spontanea_Simples_60s.mp4"
 
 # ============================================================
 # VIDEO SETTINGS
 # ============================================================
-FPS = 24
+FPS = 20
 DURATION_S = 60
+W_IN, H_IN = 12.8, 7.2
+DPI = 120
 
 # ============================================================
-# Breath model (volume-control, inspiratory flow decelerating)
-# Use a simple flow waveform: constant flow during insp then 0 hold plateau, then passive exp.
-# This produces a clear peak (R*flow) and plateau (E*V + PEEP).
+# CYCLE (3 fases, loop)
+# CRF (pausa) -> Insp -> Pausa fim-insp -> Exp -> Pausa fim-exp
 # ============================================================
-RR = 12.0                 # breaths/min
-Ttot = 60.0 / RR          # s
-Ti = 1.0                  # inspiratory time (s)
-Thold = 0.5               # inspiratory hold (plateau) (s)
-Te = max(0.5, Ttot - Ti - Thold)
-
-VT = 0.50                 # L
-PEEP = 5.0                # cmH2O
-
-# Flow during insp: constant (square) for didactic peak/plateau separation
-FLOW_INSP = VT / Ti       # L/s (so V reaches VT at end insp)
-
-# Passive expiration time constant (for V decay)
-TAU_EXP = 1.2
+T_HOLD_EE  = 1.0
+T_INSP     = 2.0
+T_HOLD_EI  = 1.0
+T_EXP      = 2.0
+T_HOLD_EE2 = 1.0
+T_CYCLE = T_HOLD_EE + T_INSP + T_HOLD_EI + T_EXP + T_HOLD_EE2  # 7 s
 
 # ============================================================
-# Scenarios: Normal, Obstructive (R↑), Restrictive/ARDS (E↑)
-# R in cmH2O/(L/s), E in cmH2O/L
+# "Fisiologia didáctica" (espontânea)
+# Convenção simples (ensino):
+#   Paw (boca) = 0 cmH2O
+#   Equação do movimento: Paw = R*Flow + E*V - Pmus
+#   -> como Paw=0:  Pmus = R*Flow + E*V
+#
+# R em cmH2O/(L/s), C em L/cmH2O, E = 1/C
 # ============================================================
-SCENARIOS = [
-    dict(name="Normal",            R=8.0,  E=14.0, color="#2563eb"),
-    dict(name="Obstrutivo (R↑)",   R=20.0, E=14.0, color="#dc2626"),
-    dict(name="Restritivo/ARDS (E↑)", R=8.0,  E=28.0, color="#7c3aed"),
-]
+R = 5.0
+C = 0.12
+E = 1.0 / C
 
-# Segment timing: each scenario runs for 20s (3 x 20 = 60)
-SEG_DUR = DURATION_S / 3.0
+# esforço muscular (amplitude)
+PMUS_PEAK = 6.0  # cmH2O (didáctico)
+
+# volume alvo só para estética (não mexe na dinâmica de sinais)
+VT_TARGET = 0.5  # L
 
 # ============================================================
 # Helpers
 # ============================================================
-def phase_in_breath(tau):
-    # tau in [0, Ttot)
-    if tau < Ti:
-        return "insp", tau / Ti
-    if tau < Ti + Thold:
-        return "hold", (tau - Ti) / Thold
-    return "exp", (tau - Ti - Thold) / max(Te, 1e-6)
+def smoothstep(x):
+    x = np.clip(x, 0.0, 1.0)
+    return 0.5 - 0.5*np.cos(np.pi*x)
 
-def flow_wave(tau):
-    ph, _ = phase_in_breath(tau)
+def phase_in_cycle(tau):
+    a = T_HOLD_EE
+    b = a + T_INSP
+    c = b + T_HOLD_EI
+    d = c + T_EXP
+    if tau < a:
+        return "hold_ee", tau / max(T_HOLD_EE, 1e-6)
+    if tau < b:
+        return "insp", (tau - a) / max(T_INSP, 1e-6)
+    if tau < c:
+        return "hold_ei", (tau - b) / max(T_HOLD_EI, 1e-6)
+    if tau < d:
+        return "exp", (tau - c) / max(T_EXP, 1e-6)
+    return "hold_ee2", (tau - d) / max(T_HOLD_EE2, 1e-6)
+
+def pmus_of_tau(tau):
+    """
+    Pmus >0 representa "força inspiratória" (queda pleural).
+    0 em CRF, sobe na inspiração, mantém na pausa, e desce na expiração.
+    """
+    ph, x = phase_in_cycle(tau)
+    if ph in ("hold_ee", "hold_ee2"):
+        return 0.0
     if ph == "insp":
-        return FLOW_INSP
-    return 0.0
-
-def volume_wave(tau):
-    ph, x = phase_in_breath(tau)
-    if ph == "insp":
-        return VT * (tau / Ti)  # linear ramp
-    if ph == "hold":
-        return VT
-    # exp: passive decay from VT toward 0 (relative to end-exp baseline)
-    # V(t) = VT * exp(-t/TAU)
-    texp = tau - (Ti + Thold)
-    return VT * np.exp(-texp / TAU_EXP)
-
-def make_history(t, window, fps):
-    t0 = max(0.0, t - window)
-    n = int(max(120, min(int(window * fps), int((t - t0) * fps + 1))))
-    return np.linspace(t0, t, n)
+        return PMUS_PEAK * smoothstep(x)
+    if ph == "hold_ei":
+        return PMUS_PEAK
+    # expiração: relaxamento
+    return PMUS_PEAK * (1.0 - smoothstep(x))
 
 def canvas_to_rgb(fig):
     fig.canvas.draw()
     return np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
 
+def history(t, window, fps):
+    t0 = max(0.0, t - window)
+    n = int(max(160, min(int(window*fps), int((t - t0)*fps + 1))))
+    return np.linspace(t0, t, n)
+
 # ============================================================
-# Plot helpers
+# Precompute one-cycle RC dynamics
+# Dynamics: 0 = R*Flow + E*V - Pmus
+# -> Flow = (Pmus - E*V)/R
 # ============================================================
-def draw_sum_bars(ax, PEEP, Pres, Pel, Paw, maxP):
-    """
-    Stacked vertical bars: PEEP base + resistive + elastic = total Paw.
-    """
+N_PRE = 5000
+tau_grid = np.linspace(0.0, T_CYCLE, N_PRE)
+dt = tau_grid[1] - tau_grid[0]
+
+pmus_grid = np.array([pmus_of_tau(tau) for tau in tau_grid])
+
+V = np.zeros_like(tau_grid)      # L above CRF
+Flow = np.zeros_like(tau_grid)   # L/s
+
+for k in range(1, len(tau_grid)):
+    pm = pmus_grid[k-1]
+    flow = (pm - E*V[k-1]) / R
+    V[k] = V[k-1] + flow * dt
+    Flow[k] = flow
+
+# scale volume to VT_TARGET for nicer lung inflation (keeps shapes)
+Vmin, Vmax = float(np.min(V)), float(np.max(V))
+if (Vmax - Vmin) > 1e-9:
+    V_scaled = (V - Vmin) * (VT_TARGET / (Vmax - Vmin))
+else:
+    V_scaled = V.copy()
+
+Flow_scaled = np.gradient(V_scaled, dt)
+
+# compute terms (cmH2O)
+Pres = R * Flow_scaled          # resistivo
+Pel  = E * V_scaled             # elástico
+Pmus_scaled = Pres + Pel        # because Paw=0
+
+def interp(arr, tau):
+    tau = tau % T_CYCLE
+    return float(np.interp(tau, tau_grid, arr))
+
+def v_of_tau(tau): return interp(V_scaled, tau)
+def f_of_tau(tau): return interp(Flow_scaled, tau)
+def pres_of_tau(tau): return interp(Pres, tau)
+def pel_of_tau(tau): return interp(Pel, tau)
+def pmus_term_of_tau(tau): return interp(Pmus_scaled, tau)
+
+# ============================================================
+# Simple lung drawing (clean, big, no clutter)
+# ============================================================
+def draw_lung(ax, inflate=0.0):
     ax.set_xlim(0, 1)
-    ax.set_ylim(0, maxP)
+    ax.set_ylim(0, 1)
     ax.axis("off")
 
-    x = 0.20
-    w = 0.20
+    # thorax frame
+    ax.add_patch(Rectangle((0.08, 0.08), 0.84, 0.84, fill=False, lw=3, edgecolor="#111827", alpha=0.75))
+    ax.text(0.50, 0.915, "Ventilação espontânea", ha="center", va="center",
+            fontsize=14, weight="bold",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="none", alpha=0.90))
 
-    # Base PEEP
-    ax.add_patch(Rectangle((x, 0), w, PEEP, facecolor="#9ca3af", alpha=0.85, edgecolor="none"))
-    # Elastic
-    ax.add_patch(Rectangle((x, PEEP), w, max(Pel,0), facecolor="#7c3aed", alpha=0.55, edgecolor="none"))
-    # Resistive (can be 0 during hold)
-    ax.add_patch(Rectangle((x, PEEP + max(Pel,0)), w, max(Pres,0), facecolor="#dc2626", alpha=0.55, edgecolor="none"))
+    # lung shapes (2 ellipses) – inflate changes size slightly
+    s = 1.0 + 0.18*np.clip(inflate, 0.0, 1.0)
+    fill = (0.97, 0.78, 0.82)
+    edge = (0.60, 0.20, 0.30)
 
-    # Total indicator
-    ax.plot([x-0.08, x+w+0.08], [Paw, Paw], lw=2.5, color="#111827")
-    ax.text(x + w/2, Paw + 0.6, "Paw", ha="center", fontsize=10, weight="bold", color="#111827")
+    ax.add_patch(Ellipse((0.43, 0.58), 0.28*s, 0.45*s, angle=8,
+                         facecolor=fill, edgecolor=edge, lw=4))
+    ax.add_patch(Ellipse((0.57, 0.58), 0.28*s, 0.45*s, angle=-8,
+                         facecolor=fill, edgecolor=edge, lw=4))
 
-    # Labels
-    ax.text(0.02, maxP*0.92, "Barras (soma)", fontsize=11, weight="bold", color="#111827")
-    ax.text(0.02, maxP*0.80, "Paw = PEEP + E·V + R·V̇", fontsize=10.5, weight="bold", color="#111827")
+    # trachea
+    ax.add_patch(FancyBboxPatch((0.485, 0.75), 0.03, 0.10,
+                                boxstyle="round,pad=0.01,rounding_size=0.02",
+                                facecolor="#111827", edgecolor="#111827"))
 
-    ax.text(0.46, PEEP + max(Pel,0) + max(Pres,0) - 0.5, f"{Paw:.1f}", fontsize=10, color="#111827", va="top")
-    ax.text(0.46, PEEP + max(Pel,0) - 0.5, f"{(PEEP+Pel):.1f}", fontsize=10, color="#7c3aed", va="top")
-    ax.text(0.46, PEEP - 0.3, f"{PEEP:.1f}", fontsize=10, color="#6b7280", va="top")
+    # diaphragm (moves down with inspiration)
+    dia = 0.20 - 0.10*np.clip(inflate, 0.0, 1.0)
+    xs = np.linspace(0.14, 0.86, 260)
+    arch = dia + 0.06*np.sin(np.pi*(xs-0.14)/(0.86-0.14))
+    ax.plot(xs, arch, lw=7, color="#111827")
+    ax.text(0.86, dia+0.02, "Diafragma", ha="right", va="center",
+            fontsize=11, weight="bold",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.85))
 
-    # Legend chips
-    ax.add_patch(Rectangle((0.02, maxP*0.12), 0.03, maxP*0.04, facecolor="#9ca3af", alpha=0.85, edgecolor="none"))
-    ax.text(0.06, maxP*0.14, "PEEP", fontsize=9.5, color="#111827", va="center")
-
-    ax.add_patch(Rectangle((0.02, maxP*0.07), 0.03, maxP*0.04, facecolor="#7c3aed", alpha=0.55, edgecolor="none"))
-    ax.text(0.06, maxP*0.09, "Elástica (E·V)", fontsize=9.5, color="#111827", va="center")
-
-    ax.add_patch(Rectangle((0.02, maxP*0.02), 0.03, maxP*0.04, facecolor="#dc2626", alpha=0.55, edgecolor="none"))
-    ax.text(0.06, maxP*0.04, "Resistiva (R·V̇)", fontsize=9.5, color="#111827", va="center")
-
-def scenario_of_time(t):
-    idx = int(t // SEG_DUR)
-    idx = max(0, min(2, idx))
-    return idx, SCENARIOS[idx]
+    # airflow arrow (depends on flow sign)
+    # red for inspiratory, green for expiratory, grey for zero
+    return
 
 # ============================================================
 # RENDER
 # ============================================================
-fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
+fig = plt.figure(figsize=(W_IN, H_IN), dpi=DPI)
+
 writer = imageio.get_writer(
     OUT,
     fps=FPS,
     codec="libx264",
     macro_block_size=1,
-    ffmpeg_params=["-preset", "ultrafast", "-crf", "22"]
+    ffmpeg_params=["-preset", "ultrafast", "-crf", "24"]
 )
 
 HIST = 10.0
 total_frames = int(DURATION_S * FPS)
 
-# Precompute max pressure for stable y-limits
-# choose conservative envelope
-MAX_PAW = 45.0
-
 for i in range(total_frames):
     t = i / FPS
-    scen_idx, scen = scenario_of_time(t)
-    R = scen["R"]
-    E = scen["E"]
+    tau = t % T_CYCLE
+    ph, _ = phase_in_cycle(tau)
 
-    # time within breath
-    tau = t % Ttot
-    ph, _ = phase_in_breath(tau)
+    Vnow = v_of_tau(tau)
+    Fnow = f_of_tau(tau)
+    Pres_now = pres_of_tau(tau)
+    Pel_now  = pel_of_tau(tau)
+    Pmus_now = pmus_term_of_tau(tau)
 
-    V = volume_wave(tau)         # L
-    Vdot = flow_wave(tau)        # L/s
-    Pres = R * Vdot              # cmH2O
-    Pel = E * V                  # cmH2O
-    Paw = PEEP + Pel + Pres      # cmH2O
+    # time history
+    th = history(t, HIST, FPS)
+    tau_h = np.array([tt % T_CYCLE for tt in th])
+    Vh = np.array([v_of_tau(x) for x in tau_h])
+    Fh = np.array([f_of_tau(x) for x in tau_h]) * 60.0  # L/min
 
-    # History
-    th = make_history(t, HIST, FPS)
-    tau_h = np.array([tt % Ttot for tt in th])
-    V_h = np.array([volume_wave(ta) for ta in tau_h])
-    Vdot_h = np.array([flow_wave(ta) for ta in tau_h])
-    Pres_h = R * Vdot_h
-    Pel_h = E * V_h
-    Paw_h = PEEP + Pres_h + Pel_h
+    Pres_h = np.array([pres_of_tau(x) for x in tau_h])
+    Pel_h  = np.array([pel_of_tau(x) for x in tau_h])
+    Pmus_h = Pres_h + Pel_h
 
-    # Cycle boundaries for shading
-    t_breath_start = t - (t % Ttot)
-    t_insp_end = t_breath_start + Ti
-    t_hold_end = t_insp_end + Thold
-    t_exp_end = t_breath_start + Ttot
-
+    # layout: 2 columns
     fig.clf()
     gs = fig.add_gridspec(
-        2, 3,
+        2, 2,
         left=0.04, right=0.985, top=0.92, bottom=0.08,
-        wspace=0.28, hspace=0.42,
-        width_ratios=[1.25, 1.55, 1.10],
-        height_ratios=[1.35, 1.05]
+        wspace=0.18, hspace=0.28,
+        width_ratios=[1.05, 1.00],
+        height_ratios=[1.00, 1.00]
     )
 
-    ax_eq   = fig.add_subplot(gs[:, 0])
-    ax_paw  = fig.add_subplot(gs[0, 1])
-    ax_flow = fig.add_subplot(gs[1, 1])
-    ax_bars = fig.add_subplot(gs[0, 2])
-    ax_txt  = fig.add_subplot(gs[1, 2])
+    ax_lung  = fig.add_subplot(gs[:, 0])     # big left
+    ax_terms = fig.add_subplot(gs[0, 1])     # top-right: equation + bars
+    ax_wave  = fig.add_subplot(gs[1, 1])     # bottom-right: small waveforms
 
-    # ------------------------------------------------------------
-    # Left: equation + sliders concept (R and E)
-    # ------------------------------------------------------------
-    ax_eq.set_xlim(0, 1)
-    ax_eq.set_ylim(0, 1)
-    ax_eq.axis("off")
+    # -------------------------
+    # LEFT: lung + diaphragm
+    # -------------------------
+    inflate = float(np.clip(Vnow / max(VT_TARGET, 1e-6), 0.0, 1.0))
+    draw_lung(ax_lung, inflate=inflate)
 
-    ax_eq.text(0.02, 0.94, "Equação do Movimento", fontsize=15, weight="bold", color="#111827")
-    ax_eq.text(0.02, 0.86, "Paw(t) = R·V̇(t) + E·V(t) + PEEP", fontsize=14, weight="bold", color="#111827")
+    # arrow + phase badge
+    if Fnow > 1e-4:
+        col = "#dc2626"
+        ax_lung.annotate("", xy=(0.50, 0.58), xytext=(0.92, 0.58),
+                         arrowprops=dict(arrowstyle="->", lw=5, color=col))
+        ax_lung.text(0.92, 0.63, "Ar entra", ha="right", fontsize=12, weight="bold",
+                     color=col, bbox=dict(boxstyle="round,pad=0.20", facecolor="white", edgecolor="none", alpha=0.88))
+    elif Fnow < -1e-4:
+        col = "#16a34a"
+        ax_lung.annotate("", xy=(0.92, 0.58), xytext=(0.50, 0.58),
+                         arrowprops=dict(arrowstyle="->", lw=5, color=col))
+        ax_lung.text(0.92, 0.63, "Ar sai", ha="right", fontsize=12, weight="bold",
+                     color=col, bbox=dict(boxstyle="round,pad=0.20", facecolor="white", edgecolor="none", alpha=0.88))
+    else:
+        ax_lung.text(0.92, 0.61, "Fluxo = 0", ha="right", fontsize=12, weight="bold",
+                     color="#6b7280", bbox=dict(boxstyle="round,pad=0.20", facecolor="white", edgecolor="none", alpha=0.88))
 
-    # Chips
-    ax_eq.text(0.02, 0.78, "Interpretação clínica (ultra simples):", fontsize=11.5, weight="bold", color="#111827")
-    ax_eq.text(0.03, 0.71, "• R·V̇  → 'tubo' (vias aéreas / resistência)", fontsize=11, color="#111827")
-    ax_eq.text(0.03, 0.65, "• E·V  → 'balão' (rigidez / elastância)", fontsize=11, color="#111827")
-    ax_eq.text(0.03, 0.59, "• PEEP → 'base' (pulmão já aberto)", fontsize=11, color="#111827")
+    phase_txt = {
+        "hold_ee":  "CRF (pausa)",
+        "insp":     "INSPIRAÇÃO",
+        "hold_ei":  "Fim INSP (pausa)",
+        "exp":      "EXPIRAÇÃO",
+        "hold_ee2": "CRF (pausa)",
+    }[ph]
+    ax_lung.text(0.10, 0.12, phase_txt,
+                 fontsize=14, weight="bold",
+                 bbox=dict(boxstyle="round,pad=0.25", facecolor="#111827", edgecolor="none", alpha=0.90),
+                 color="white")
 
-    # Draw R slider
-    ax_eq.text(0.02, 0.49, f"R = {R:.0f} cmH₂O/(L/s)", fontsize=12, weight="bold", color="#dc2626")
-    ax_eq.add_patch(Rectangle((0.02, 0.45), 0.80, 0.03, facecolor="#fee2e2", edgecolor="#fecaca"))
-    r_frac = np.clip((R - 6.0) / (24.0 - 6.0), 0, 1)
-    ax_eq.add_patch(Rectangle((0.02, 0.45), 0.80*r_frac, 0.03, facecolor="#dc2626", alpha=0.75, edgecolor="none"))
+    ax_lung.text(0.10, 0.06, f"V = {Vnow:.2f} L   |   Fluxo = {Fnow*60:.0f} L/min",
+                 fontsize=11, weight="bold",
+                 bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#e5e7eb", alpha=0.92),
+                 color="#111827")
 
-    # Draw E slider
-    ax_eq.text(0.02, 0.38, f"E = {E:.0f} cmH₂O/L", fontsize=12, weight="bold", color="#7c3aed")
-    ax_eq.add_patch(Rectangle((0.02, 0.34), 0.80, 0.03, facecolor="#ede9fe", edgecolor="#ddd6fe"))
-    e_frac = np.clip((E - 10.0) / (32.0 - 10.0), 0, 1)
-    ax_eq.add_patch(Rectangle((0.02, 0.34), 0.80*e_frac, 0.03, facecolor="#7c3aed", alpha=0.65, edgecolor="none"))
+    # -------------------------
+    # TOP-RIGHT: equation + bars
+    # -------------------------
+    ax_terms.set_xlim(0, 1)
+    ax_terms.set_ylim(0, 1)
+    ax_terms.axis("off")
 
-    # PEEP
-    ax_eq.text(0.02, 0.27, f"PEEP = {PEEP:.0f} cmH₂O", fontsize=12, weight="bold", color="#6b7280")
+    # equation (big, clean)
+    ax_terms.text(0.02, 0.92, "Equação do movimento (espontânea)", fontsize=14, weight="bold", color="#111827")
+    ax_terms.text(0.02, 0.78, "Paw = R·Fluxo + E·V − Pmus", fontsize=16, weight="bold", color="#111827")
+    ax_terms.text(0.02, 0.66, "Como Paw = 0 (boca):   Pmus = R·Fluxo + E·V", fontsize=14, weight="bold", color="#111827")
 
-    # Scenario badge
-    badge = FancyBboxPatch((0.02, 0.12), 0.80, 0.10,
-                           boxstyle="round,pad=0.02,rounding_size=0.03",
-                           facecolor="#f3f4f6", edgecolor="#e5e7eb")
-    ax_eq.add_patch(badge)
-    ax_eq.text(0.04, 0.17, f"Cenário: {scen['name']}", fontsize=12.5, weight="bold", color="#111827", va="center")
-    ax_eq.text(0.04, 0.09, "Humor clínico: se o pico sobe → olha para R.\nSe o plateau sobe → culpa o E.",
-               fontsize=9.8, color="#111827")
+    # numeric values
+    ax_terms.text(0.02, 0.55, f"R·Fluxo  (resistivo) = {Pres_now:+.1f} cmH₂O", fontsize=12, weight="bold", color="#dc2626")
+    ax_terms.text(0.02, 0.48, f"E·V      (elástico)  = {Pel_now:+.1f} cmH₂O", fontsize=12, weight="bold", color="#7c3aed")
+    ax_terms.text(0.02, 0.41, f"Pmus     (esforço)   = {Pmus_now:+.1f} cmH₂O", fontsize=12, weight="bold", color="#111827")
 
-    # ------------------------------------------------------------
-    # Top middle: Paw curve with peak/plateau concept
-    # ------------------------------------------------------------
-    ax_paw.set_title("Paw(t) (cmH₂O) — pico vs plateau", fontsize=11.5, weight="bold")
-    ax_paw.plot(th, Paw_h, lw=3.0, color=scen["color"], label="Paw")
-    ax_paw.plot(th, PEEP + Pel_h, lw=2.0, color="#7c3aed", alpha=0.55, label="PEEP+E·V (plateau base)")
-    ax_paw.axhline(PEEP, color="#9ca3af", lw=1.2, alpha=0.8)
-    ax_paw.set_ylim(0, MAX_PAW)
-    ax_paw.grid(True, alpha=0.25)
-    ax_paw.set_xlabel("Tempo (s)")
-    ax_paw.set_ylabel("cmH₂O")
-    ax_paw.legend(loc="upper right", fontsize=9, frameon=True)
+    # bar chart (stacked) – occupies big area, no text overlap
+    # Scale for consistent look
+    max_scale = max(8.0, float(np.max(Pmus_h))*1.15)
 
-    # Shade phases
-    ax_paw.axvspan(t_breath_start, t_insp_end, color="#fecaca", alpha=0.12)   # insp
-    ax_paw.axvspan(t_insp_end, t_hold_end, color="#fef3c7", alpha=0.14)      # hold
-    ax_paw.axvspan(t_hold_end, t_exp_end, color="#bbf7d0", alpha=0.08)       # exp
+    # base frame
+    bx0, by0, bw, bh = 0.62, 0.18, 0.34, 0.64
+    ax_terms.add_patch(Rectangle((bx0, by0), bw, bh, fill=False, lw=2.2, edgecolor="#111827", alpha=0.85))
+    ax_terms.text(bx0 + bw/2, by0 + bh + 0.03, "Contributos (cmH₂O)", ha="center", fontsize=11, weight="bold", color="#111827")
 
-    # markers
-    ax_paw.scatter([t], [Paw], s=55, color="#111827", zorder=5)
+    # map value to height
+    def h_of(val):
+        return (val / max_scale) * (bh*0.92)
 
-    # annotate peak vs plateau during hold
-    if ph == "hold":
-        ax_paw.text(t, Paw + 2.0, "Plateau (fluxo=0)\n≈ PEEP + E·V",
-                    fontsize=9.5, color="#111827",
-                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.92, edgecolor="#e5e7eb"))
-    elif ph == "insp":
-        ax_paw.text(t, Paw + 2.0, "Pico = Plateau + R·V̇",
-                    fontsize=9.5, color="#111827",
-                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.92, edgecolor="#e5e7eb"))
+    # stacked bar up from baseline
+    base = by0 + 0.04
+    pres_h = max(0.0, h_of(Pres_now))
+    pel_h  = max(0.0, h_of(Pel_now))
+    total_h = pres_h + pel_h
 
-    # ------------------------------------------------------------
-    # Bottom middle: flow and volume overlays
-    # ------------------------------------------------------------
-    ax_flow.set_title("V̇(t) (L/s) e V(t) (L)", fontsize=11.0, weight="bold")
-    ax_flow.plot(th, Vdot_h, lw=2.6, color="#dc2626", label="V̇ (fluxo)")
-    ax_flow.plot(th, V_h, lw=2.6, color="#2563eb", label="V (volume)")
-    ax_flow.axhline(0, color="#9ca3af", lw=1.1)
-    ax_flow.set_ylim(-0.2, max(FLOW_INSP*1.5, 0.9))
-    ax_flow.grid(True, alpha=0.25)
-    ax_flow.set_xlabel("Tempo (s)")
-    ax_flow.legend(loc="upper right", fontsize=9, frameon=True)
+    ax_terms.add_patch(Rectangle((bx0+0.08, base), 0.10, pres_h, facecolor="#fecaca", edgecolor="#dc2626", lw=1.8))
+    ax_terms.add_patch(Rectangle((bx0+0.08, base+pres_h), 0.10, pel_h, facecolor="#ede9fe", edgecolor="#7c3aed", lw=1.8))
 
-    ax_flow.axvspan(t_breath_start, t_insp_end, color="#fecaca", alpha=0.12)
-    ax_flow.axvspan(t_insp_end, t_hold_end, color="#fef3c7", alpha=0.14)
-    ax_flow.axvspan(t_hold_end, t_exp_end, color="#bbf7d0", alpha=0.08)
+    # total marker line
+    ax_terms.plot([bx0+0.06, bx0+0.24], [base+total_h, base+total_h], color="#111827", lw=2.2)
+    ax_terms.text(bx0+0.26, base+total_h, f"{Pmus_now:.1f}", va="center", fontsize=11, weight="bold", color="#111827")
 
-    # ------------------------------------------------------------
-    # Top right: stacked bars (visual sum)
-    # ------------------------------------------------------------
-    draw_sum_bars(ax_bars, PEEP=PEEP, Pres=Pres, Pel=Pel, Paw=Paw, maxP=MAX_PAW)
+    # legend
+    ax_terms.text(bx0+0.08, by0+0.05, "resistivo", fontsize=10, color="#dc2626", weight="bold")
+    ax_terms.text(bx0+0.18, by0+0.05, "elástico",  fontsize=10, color="#7c3aed", weight="bold")
 
-    # ------------------------------------------------------------
-    # Bottom right: live numbers + “teaching punchline”
-    # ------------------------------------------------------------
-    ax_txt.set_xlim(0, 1)
-    ax_txt.set_ylim(0, 1)
-    ax_txt.axis("off")
+    # one-line humour (minimal, not cringe)
+    ax_terms.text(0.02, 0.16, "Ideia-chave: no início ΔP é maior → fluxo acelera; depois desacelera até 0.", fontsize=11, weight="bold", color="#374151")
 
-    ax_txt.text(0.02, 0.92, "Leituras (agora)", fontsize=12.5, weight="bold", color="#111827")
-    ax_txt.text(0.02, 0.82, f"V̇ = {Vdot:.2f} L/s", fontsize=11.5, weight="bold", color="#dc2626")
-    ax_txt.text(0.02, 0.74, f"V  = {V:.2f} L", fontsize=11.5, weight="bold", color="#2563eb")
-    ax_txt.text(0.02, 0.66, f"R·V̇ = {Pres:.1f} cmH₂O", fontsize=11.5, weight="bold", color="#dc2626")
-    ax_txt.text(0.02, 0.58, f"E·V  = {Pel:.1f} cmH₂O", fontsize=11.5, weight="bold", color="#7c3aed")
-    ax_txt.text(0.02, 0.50, f"PEEP = {PEEP:.1f} cmH₂O", fontsize=11.5, weight="bold", color="#6b7280")
-    ax_txt.text(0.02, 0.40, f"Paw  = {Paw:.1f} cmH₂O", fontsize=12.5, weight="bold", color="#111827")
+    # -------------------------
+    # BOTTOM-RIGHT: waveforms (simple, 2 curves)
+    # -------------------------
+    ax_wave.set_title("Fluxo e Volume (janela ~10 s)", fontsize=12, weight="bold")
+    ax_wave.plot(th, Fh, lw=2.4, label="Fluxo (L/min)")
+    ax_wave.plot(th, Vh, lw=2.4, label="Volume (L)")
+    ax_wave.axhline(0, color="#9ca3af", lw=1.1)
+    ax_wave.grid(True, alpha=0.20)
+    ax_wave.set_xlabel("Tempo (s)")
+    ax_wave.legend(loc="upper right", fontsize=10, frameon=True)
 
-    # Quick rules (peak vs plateau)
-    ax_txt.text(
-        0.02, 0.22,
-        "Regras rápidas:\n"
-        "• Se o pico ↑ e o plateau ~igual → resistência (R↑)\n"
-        "• Se o plateau ↑ → elastância (E↑) / pulmão rígido\n"
-        "• PEEP desloca tudo para cima (base)",
-        fontsize=9.8,
-        bbox=dict(boxstyle="round,pad=0.30", facecolor="#f3f4f6", edgecolor="#e5e7eb", alpha=0.95),
-        color="#111827"
-    )
-
-    fig.suptitle("Equação do Movimento — vídeo didático (ICU)", fontsize=15, weight="bold", y=0.985)
-    plt.tight_layout()
+    fig.suptitle("Equação do Movimento — Ventilação Espontânea (visual simples)", fontsize=16, weight="bold", y=0.985)
+    fig.tight_layout()
     writer.append_data(canvas_to_rgb(fig))
 
 writer.close()
