@@ -1,4 +1,4 @@
-name: Render Equacao do Movimento
+name: Render Equação do Movimento (Espontânea)
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,9 +26,10 @@ jobs:
           MPLBACKEND: Agg
         run: |
           python render.py
+          echo "Generated files:"
           ls -lah
 
-      - name: Upload video artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: EQUACAO_MOVIMENTO_VIDEO
