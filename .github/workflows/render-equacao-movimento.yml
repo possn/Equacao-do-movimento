@@ -1,4 +1,4 @@
-name: Render Equacao Movimento Respiracao
+name: Render Equação Movimento
 
 on:
   workflow_dispatch:
@@ -8,27 +8,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install python deps
         run: |
-          python -m pip install --upgrade pip
           pip install numpy matplotlib imageio[ffmpeg]
 
       - name: Render video
         env:
           MPLBACKEND: Agg
-        run: |
-          python render.py
+        run: python render.py
 
-      - name: Upload artifact
+      - name: Upload video
         uses: actions/upload-artifact@v4
         with:
-          name: VIDEO_EQUACAO_MOVIMENTO
+          name: EQUACAO_MOVIMENTO
           path: "*.mp4"
